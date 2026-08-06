@@ -1,0 +1,112 @@
+# =========================
+# Node.js
+# =========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# =========================
+# Environment Variables
+# =========================
+.env
+.env.local
+.env.*
+!.env.example
+
+# =========================
+# Python
+# =========================
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Python cache
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# =========================
+# AI Models
+# (Generated after training)
+# =========================
+python/app/models/*.pth
+python/app/models/*.pt
+python/app/models/*.pkl
+python/app/models/*.joblib
+python/app/models/*.onnx
+python/app/models/*.keras
+
+# =========================
+# Training Outputs
+# =========================
+python/app/training/output/
+python/app/training/logs/
+python/app/training/checkpoints/
+python/app/training/runs/
+
+# =========================
+# Dataset
+# (Keep folder, ignore heavy files)
+# =========================
+dataset/*.pkl
+dataset/*.zip
+dataset/*.tar
+dataset/*.tar.gz
+dataset/*.7z
+
+# Keep documentation/examples
+!dataset/README.md
+
+# =========================
+# Uploads
+# =========================
+server/uploads/*
+!server/uploads/.gitkeep
+
+# =========================
+# Generated Files
+# =========================
+*.log
+*.tmp
+*.bak
+*.cache
+
+# =========================
+# DXF / CAD Outputs
+# =========================
+*.dxf
+*.dwg
+
+# =========================
+# 3D Models
+# =========================
+*.glb
+*.gltf
+*.obj
+*.fbx
+
+# =========================
+# Reports / Exports
+# =========================
+exports/
+reports/
+generated/
+
+# =========================
+# IDE
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# OS Files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
