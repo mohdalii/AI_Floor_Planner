@@ -1,112 +1,121 @@
-# =========================
+# ==========================================
 # Node.js
-# =========================
-node_modules/
+# ==========================================
+**/node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-package-lock.json
+pnpm-debug.log*
 
-# =========================
+# Optional (remove if you want package-lock.json in Git)
+# package-lock.json
+
+# ==========================================
 # Environment Variables
-# =========================
+# ==========================================
 .env
-.env.local
 .env.*
 !.env.example
 
-# =========================
+# ==========================================
 # Python
-# =========================
-venv/
-.venv/
+# ==========================================
+**/venv/
+**/.venv/
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 *.so
 
-# Python cache
 .pytest_cache/
 .mypy_cache/
 .ipynb_checkpoints/
 
-# =========================
-# AI Models
-# (Generated after training)
-# =========================
-python/app/models/*.pth
-python/app/models/*.pt
-python/app/models/*.pkl
-python/app/models/*.joblib
-python/app/models/*.onnx
-python/app/models/*.keras
+# ==========================================
+# AI Models (Generated after training)
+# ==========================================
+python/app/models/*
+!python/app/models/.gitkeep
 
-# =========================
+# ==========================================
 # Training Outputs
-# =========================
+# ==========================================
 python/app/training/output/
 python/app/training/logs/
 python/app/training/checkpoints/
 python/app/training/runs/
 
-# =========================
-# Dataset
-# (Keep folder, ignore heavy files)
-# =========================
+# ==========================================
+# Original Dataset
+# ==========================================
 dataset/*.pkl
 dataset/*.zip
 dataset/*.tar
 dataset/*.tar.gz
 dataset/*.7z
 
-# Keep documentation/examples
+# If we later create dataset/raw
+dataset/raw/*.pkl
+dataset/raw/*.zip
+
+# Keep documentation
 !dataset/README.md
 
-# =========================
+# ==========================================
+# Generated Layouts
+# ==========================================
+dataset/layouts/*.json
+
+# ==========================================
+# Generated Cost Files
+# ==========================================
+dataset/cost/generated/
+
+# ==========================================
 # Uploads
-# =========================
+# ==========================================
 server/uploads/*
 !server/uploads/.gitkeep
 
-# =========================
+# ==========================================
 # Generated Files
-# =========================
+# ==========================================
 *.log
 *.tmp
 *.bak
 *.cache
 
-# =========================
-# DXF / CAD Outputs
-# =========================
+# ==========================================
+# CAD / 3D Files
+# ==========================================
 *.dxf
 *.dwg
-
-# =========================
-# 3D Models
-# =========================
 *.glb
 *.gltf
 *.obj
 *.fbx
 
-# =========================
+# ==========================================
 # Reports / Exports
-# =========================
+# ==========================================
 exports/
 reports/
 generated/
 
-# =========================
-# IDE
-# =========================
+# ==========================================
+# VS Code
+# ==========================================
 .vscode/
+
+# ==========================================
+# JetBrains
+# ==========================================
 .idea/
 
-# =========================
+# ==========================================
 # OS Files
-# =========================
+# ==========================================
 .DS_Store
 Thumbs.db
 desktop.ini
