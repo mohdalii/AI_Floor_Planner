@@ -1,121 +1,185 @@
-# ==========================================
+# ============================================================
 # Node.js
-# ==========================================
-**/node_modules/
+# ============================================================
+
+node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# Optional (remove if you want package-lock.json in Git)
+# Keep package lock files
 # package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
 
-# ==========================================
-# Environment Variables
-# ==========================================
+
+# ============================================================
+# Environment Variables / Secrets
+# ============================================================
+
 .env
-.env.*
+.env.local
+.env.*.local
+
 !.env.example
 
-# ==========================================
+
+# ============================================================
 # Python
-# ==========================================
-**/venv/
-**/.venv/
+# ============================================================
+
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-*.so
+
+venv/
+.venv/
 
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+
 .ipynb_checkpoints/
 
-# ==========================================
-# AI Models (Generated after training)
-# ==========================================
-python/app/models/*
-!python/app/models/.gitkeep
 
-# ==========================================
+# ============================================================
+# AI / ML MODELS
+# Generated after training - DO NOT COMMIT
+# ============================================================
+
+python/app/models/*.pt
+python/app/models/*.pth
+python/app/models/*.pkl
+python/app/models/*.joblib
+python/app/models/*.onnx
+python/app/models/*.keras
+python/app/models/*.h5
+python/app/models/*.safetensors
+python/app/models/*.bin
+
+
+# ============================================================
 # Training Outputs
-# ==========================================
+# ============================================================
+
 python/app/training/output/
 python/app/training/logs/
 python/app/training/checkpoints/
 python/app/training/runs/
 
-# ==========================================
-# Original Dataset
-# ==========================================
+python/app/training/*.log
+
+
+# ============================================================
+# Large Dataset Files
+# ============================================================
+
 dataset/*.pkl
+dataset/*.pickle
 dataset/*.zip
 dataset/*.tar
 dataset/*.tar.gz
 dataset/*.7z
+dataset/*.rar
 
-# If we later create dataset/raw
-dataset/raw/*.pkl
-dataset/raw/*.zip
 
-# Keep documentation
-!dataset/README.md
+# ============================================================
+# Generated Training Datasets
+# ============================================================
 
-# ==========================================
-# Generated Layouts
-# ==========================================
-dataset/layouts/*.json
+dataset/training/*.json
+dataset/training/*.csv
 
-# ==========================================
-# Generated Cost Files
-# ==========================================
-dataset/cost/generated/
+dataset/training_samples.json
+dataset/resplan_graphs.json
+dataset/room_adjacency.json
+dataset/training_features.csv
+dataset/training_clean.csv
 
-# ==========================================
-# Uploads
-# ==========================================
+
+# ============================================================
+# Generated Dataset / Analysis Files
+# ============================================================
+
+dataset/generated/
+dataset/processed/
+dataset/cache/
+
+
+# ============================================================
+# User Uploads
+# ============================================================
+
 server/uploads/*
 !server/uploads/.gitkeep
 
-# ==========================================
-# Generated Files
-# ==========================================
-*.log
-*.tmp
-*.bak
-*.cache
 
-# ==========================================
-# CAD / 3D Files
-# ==========================================
+# ============================================================
+# Generated Floor Plans
+# ============================================================
+
+generated/
+exports/
+reports/
+
 *.dxf
 *.dwg
+
+
+# ============================================================
+# CAD / 3D Generated Files
+# ============================================================
+
 *.glb
 *.gltf
 *.obj
 *.fbx
+*.stl
 
-# ==========================================
-# Reports / Exports
-# ==========================================
-exports/
-reports/
-generated/
 
-# ==========================================
-# VS Code
-# ==========================================
+# ============================================================
+# Temporary / Cache Files
+# ============================================================
+
+*.log
+*.tmp
+*.temp
+*.bak
+*.cache
+
+
+# ============================================================
+# IDE
+# ============================================================
+
 .vscode/
-
-# ==========================================
-# JetBrains
-# ==========================================
 .idea/
 
-# ==========================================
-# OS Files
-# ==========================================
+
+# ============================================================
+# OS
+# ============================================================
+
 .DS_Store
 Thumbs.db
 desktop.ini
+
+
+# ============================================================
+# Python Build Files
+# ============================================================
+
+build/
+dist/
+*.egg-info/
+
+
+# ============================================================
+# Local Experiment Files
+# ============================================================
+
+experiments/
+scratch/
+debug/
