@@ -8,7 +8,7 @@ from torch.utils.data import Dataset, DataLoader
 ROOT = Path(".")
 
 TEST_PATH = ROOT / "dataset" / "geometry_v2_training" / "test.json"
-MODEL_PATH = ROOT / "python" / "app" / "models" / "room_geometry_v3.pt"
+MODEL_PATH = ROOT / "python" / "app" / "models" / "room_geometry_v4.pt"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -169,7 +169,7 @@ def collate_fn(batch):
     )
 
 
-class RoomGeometryV3(nn.Module):
+class RoomGeometryV4(nn.Module):
 
     def __init__(self):
 
@@ -386,7 +386,7 @@ def collision_rate(boxes, mask):
 
 
 print("=" * 70)
-print("AI FLOOR PLANNER - GEOMETRY V3 TEST")
+print("AI FLOOR PLANNER - GEOMETRY V4 TEST")
 print("=" * 70)
 
 print("\nDevice:", DEVICE)
@@ -402,7 +402,7 @@ loader = DataLoader(
     collate_fn=collate_fn,
 )
 
-model = RoomGeometryV3().to(DEVICE)
+model = RoomGeometryV4().to(DEVICE)
 
 checkpoint = torch.load(
     MODEL_PATH,
@@ -569,7 +569,7 @@ ROOM_TYPES = [
 ]
 
 print("\n" + "=" * 70)
-print("GEOMETRY V3 TEST RESULTS")
+print("GEOMETRY V4 TEST RESULTS")
 print("=" * 70)
 
 print(

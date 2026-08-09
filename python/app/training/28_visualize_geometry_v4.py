@@ -1,4 +1,4 @@
-import json
+﻿import json
 from pathlib import Path
 
 import torch
@@ -9,7 +9,7 @@ from matplotlib.patches import Rectangle
 ROOT = Path(".")
 
 TEST_PATH = ROOT / "dataset" / "geometry_v2_training" / "test.json"
-MODEL_PATH = ROOT / "python" / "app" / "models" / "room_geometry_v3.pt"
+MODEL_PATH = ROOT / "python" / "app" / "models" / "room_geometry_v4.pt"
 OUTPUT_DIR = ROOT / "dataset" / "geometry_v3_predictions"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -50,7 +50,7 @@ from geometry_layout_solver import (
 # V3 MODEL
 # ------------------------------------------------------------
 
-class RoomGeometryV3(nn.Module):
+class RoomGeometryV4(nn.Module):
 
     def __init__(self):
         super().__init__()
@@ -234,7 +234,7 @@ def draw_layout(
 # ------------------------------------------------------------
 
 print("=" * 70)
-print("AI FLOOR PLANNER - V3 + LAYOUT SOLVER")
+print("AI FLOOR PLANNER - V4 + LAYOUT SOLVER")
 print("=" * 70)
 
 print("\nDevice:", DEVICE)
@@ -249,7 +249,7 @@ with open(
 
 print("Test samples:", len(samples))
 
-model = RoomGeometryV3().to(DEVICE)
+model = RoomGeometryV4().to(DEVICE)
 
 checkpoint = torch.load(
     MODEL_PATH,
@@ -451,7 +451,7 @@ for sample_index in range(
         axes[2],
         solved_boxes,
         rooms,
-        f"V3 + LAYOUT SOLVER\nCollision: {solved_collision:.1%}",
+        f"V4 + LAYOUT SOLVER\nCollision: {solved_collision:.1%}",
     )
 
     output_path = (
@@ -485,7 +485,7 @@ for sample_index in range(
 count = min(10, len(samples))
 
 print("\n" + "=" * 70)
-print("V3 + LAYOUT SOLVER COMPLETE")
+print("V4 + LAYOUT SOLVER COMPLETE")
 print("=" * 70)
 
 print(
@@ -504,3 +504,4 @@ print(
 )
 
 print("\nDone.")
+
