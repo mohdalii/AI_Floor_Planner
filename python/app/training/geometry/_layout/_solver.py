@@ -35,14 +35,17 @@ SIZE_RANGES = {
     7: (0.006, 0.035), # front door
 }
 
+# Settling order follows a "plot-first" staging: public zone first,
+# then the private zone that depends on it, then rooms that depend on
+# the private zone, then service/exterior rooms, then the entrance.
 PRIORITY = {
-    3: 100,  # living
-    2: 90,   # kitchen
-    0: 80,   # bedroom
-    1: 50,   # bathroom
-    5: 35,   # storage
-    4: 25,   # balcony
-    7: 10,   # front door
+    3: 100,  # living (public zone anchor)
+    0: 85,   # bedroom (private zone, placed relative to living)
+    1: 70,   # bathroom (depends on bedrooms being placed)
+    2: 60,   # kitchen (depends on living)
+    5: 40,   # storage (depends on kitchen)
+    4: 25,   # balcony (depends on bedroom/living, exterior)
+    7: 10,   # front door (depends on living, exterior)
 }
 
 
@@ -275,9 +278,14 @@ def _relationship_cost(boxes, i, room_types, ids, attach_map, bedroom_ids, livin
         cost += 8.0 * max(edge - 0.05, 0.0)
     elif t == 4:  # balcony strongly prefers an exterior wall
         cost += 5.0 * max(edge - 0.12, 0.0)
-    elif t in (1, 2, 3, 5):
-        # interior rooms shouldn't unnecessarily hug the boundary
+    elif t in (1, 5):
+        # bathrooms/storage are fine internal - discourage them from
+        # eating exterior wall that a bedroom/living/kitchen could use
         cost += 1.2 * max(0.05 - edge, 0.0)
+    # bedroom(0)/kitchen(2)/living(3) are deliberately NOT penalized
+    # for touching an exterior wall - they need windows too, and
+    # forcing them inward was fighting the "rooms that need exterior
+    # access should get it" rule for no benefit.
 
     if t == 0:
         others = [r for r in bedroom_ids if r != i]
@@ -319,7 +327,7 @@ def _total_priority_cost(boxes, room_types, original, ids, attach_map, bedroom_i
 # CANDIDATE SEARCH
 # ------------------------------------------------------------
 
-def _candidate_centers(box, room_type, living_center=None, attach_center=None):
+def _candidate_centers(box, room_type, living_center=None, attach_box=None):
     cx, cy, w, h = [float(v) for v in box]
     candidates = [(cx, cy)]
 
@@ -343,16 +351,43 @@ def _candidate_centers(box, room_type, living_center=None, attach_center=None):
             (lx, ly - 0.28), (lx, ly + 0.28),
         ]
 
-    # A room with a specific attachment target (an en-suite bathroom's
-    # bedroom, a shared bathroom's or the door's living room) needs a
-    # way to jump toward THAT room directly - local steps alone can get
-    # stuck behind other rooms and never reach it.
-    if attach_center is not None:
-        tx, ty = attach_center
+    if attach_box is not None:
+        tx, ty, tw, th = attach_box
+
+        # Exact flush-against-target positions (share a wall) - this is
+        # what an en-suite bathroom or an attached kitchen actually
+        # needs, not just "somewhere nearby". Offered at the target's
+        # own center plus a couple of lateral slides, in case the
+        # dead-center position would collide with a third room.
+        for off in (0.0, 0.06, -0.06, 0.12, -0.12):
+            candidates += [
+                (tx + tw/2 + w/2, ty + off),
+                (tx - tw/2 - w/2, ty + off),
+                (tx + off, ty + th/2 + h/2),
+                (tx + off, ty - th/2 - h/2),
+            ]
+
+        # Coarser jumps toward the target's general area, for when the
+        # room starts out too far away for a flush position to be
+        # reachable without passing through something else first.
         for r in (0.12, 0.20, 0.30):
             candidates += [
                 (tx - r, ty), (tx + r, ty),
                 (tx, ty - r), (tx, ty + r),
+            ]
+
+    if t in (4, 7):
+        # Balcony/front door need to land on the exterior wall. Offer
+        # exact boundary positions directly so the tiered search can
+        # find something that's on the exterior AND collision-free AND
+        # close to its target in one shot, instead of relying on a
+        # separate post-process step that can't see the same tradeoffs.
+        for coord in (0.1, 0.3, 0.5, 0.7, 0.9):
+            candidates += [
+                (coord, h/2 + 0.01),
+                (coord, 1 - h/2 - 0.01),
+                (w/2 + 0.01, coord),
+                (1 - w/2 - 0.01, coord),
             ]
 
     return candidates
@@ -367,10 +402,10 @@ def _place_one(boxes, i, room_types, original, ids, attach_map, bedroom_ids, liv
 
     t = int(room_types[i])
     target = attach_map.get(i)
-    attach_center = _center(boxes[target]) if target is not None else None
+    attach_box = tuple(float(v) for v in boxes[target]) if target is not None else None
     living_center = _center(boxes[living_id]) if living_id is not None else None
 
-    for cx, cy in _candidate_centers(current, t, living_center, attach_center):
+    for cx, cy in _candidate_centers(current, t, living_center, attach_box):
         trial = boxes.clone()
         trial[i, 0] = cx
         trial[i, 1] = cy
@@ -388,18 +423,118 @@ def _place_one(boxes, i, room_types, original, ids, attach_map, bedroom_ids, liv
     return changed
 
 
+def _validity_reason(boxes, i, room_types, ids, attach_map,
+                      touch_tolerance=0.02, exterior_tolerance=0.02):
+    """Why (if at all) room i needs to move. Returns None when the room
+    is already fine and should be left exactly where the model put it -
+    this is the minimal-movement gate: a room is never moved just
+    because some other position would score marginally better, only
+    because something concrete is actually wrong with where it is."""
+    b = boxes[i]
+
+    for j in ids:
+        if j == i:
+            continue
+        ow, oh = _overlap(b, boxes[j])
+        if ow > 1e-5 and oh > 1e-5:
+            return "collision"
+
+    t = int(room_types[i])
+    cx, cy = _center(b)
+    edge = min(cx, cy, 1 - cx, 1 - cy)
+
+    if t == 7 and edge > exterior_tolerance:
+        return "front_door_not_on_exterior_wall"
+    if t == 4 and edge > 0.12 + exterior_tolerance:
+        return "balcony_not_on_exterior_wall"
+
+    target = attach_map.get(i)
+    if target is not None and _gap_to_room(boxes, i, target) > touch_tolerance:
+        return "required_adjacency_not_satisfied"
+
+    return None
+
+
+def validate_layout(boxes, room_types, ids, attach_map):
+    """The MVP's explicit final-validation checklist, run after solving.
+    Returns {check_name: passed} - does not mutate the layout."""
+    checks = {}
+
+    checks["no_staircase"] = not any(int(room_types[i]) == 6 for i in ids)
+
+    collision_free = True
+    inside_plot = True
+    for i in ids:
+        cx, cy, w, h = [float(v) for v in boxes[i]]
+        if cx - w/2 < -1e-4 or cy - h/2 < -1e-4 or cx + w/2 > 1.0001 or cy + h/2 > 1.0001:
+            inside_plot = False
+    for p in range(len(ids)):
+        for q in range(p + 1, len(ids)):
+            ow, oh = _overlap(boxes[ids[p]], boxes[ids[q]])
+            if ow > 1e-5 and oh > 1e-5:
+                collision_free = False
+    checks["no_overlaps"] = collision_free
+    checks["all_inside_plot"] = inside_plot
+
+    doors = [i for i in ids if int(room_types[i]) == 7]
+    living = [i for i in ids if int(room_types[i]) == 3]
+    living_id = living[0] if living else None
+    kitchens = [i for i in ids if int(room_types[i]) == 2]
+    balconies = [i for i in ids if int(room_types[i]) == 4]
+    baths = [i for i in ids if int(room_types[i]) == 1]
+
+    checks["front_door_on_exterior"] = all(
+        min(_center(boxes[d])[0], _center(boxes[d])[1],
+            1 - _center(boxes[d])[0], 1 - _center(boxes[d])[1]) <= 0.05
+        for d in doors
+    ) if doors else True
+
+    checks["front_door_near_living"] = all(
+        _gap_to_room(boxes, d, living_id) <= 0.03 for d in doors
+    ) if (doors and living_id is not None) else True
+
+    checks["kitchen_adjacent_to_living"] = all(
+        _gap_to_room(boxes, k, living_id) <= 0.03 for k in kitchens
+    ) if (kitchens and living_id is not None) else True
+
+    checks["balconies_on_exterior"] = all(
+        min(_center(boxes[bi])[0], _center(boxes[bi])[1],
+            1 - _center(boxes[bi])[0], 1 - _center(boxes[bi])[1]) <= 0.14
+        for bi in balconies
+    ) if balconies else True
+
+    checks["ensuite_bathrooms_adjacent"] = all(
+        _gap_to_room(boxes, bi, attach_map[bi]) <= 0.03
+        for bi in baths
+        if attach_map.get(bi) is not None and int(room_types[attach_map[bi]]) == 0
+    )
+
+    checks["living_room_not_oversized"] = (
+        _room_area(boxes, living_id) <= 0.5 if living_id is not None else True
+    )
+
+    return checks
+
+
 def _enforce_exterior(boxes, room_types, ids, attach_map=None):
-    """Snap balcony/front-door onto the exterior wall - toward whichever
-    edge is nearest their attach target (e.g. the master bedroom a
-    balcony belongs to), not just whichever edge the room happens to be
-    sitting closest to right now. That was the previous failure mode:
-    exterior snapping that ignored the room's actual relationship."""
+    """Light cleanup pass for balcony/front-door: nudge onto the
+    exterior wall toward whichever edge is nearest their attach target,
+    but only when the room isn't already on the boundary, and only if
+    doing so doesn't create a new collision it didn't already have.
+    (The main tiered search in _place_one now has direct boundary
+    candidates too, so this is a backstop, not the primary mechanism -
+    it used to unconditionally re-snap every iteration regardless of
+    what that displaced into, which fought _place_one's own collision
+    fixes and could cycle indefinitely.)"""
     for i in ids:
         t = int(room_types[i])
         if t not in (4, 7):
             continue
 
         cx, cy, w, h = [float(v) for v in boxes[i]]
+        edge = min(cx, cy, 1 - cx, 1 - cy)
+        if edge <= 0.02:
+            continue
 
         ref_x, ref_y = cx, cy
         target = attach_map.get(i) if attach_map else None
@@ -412,9 +547,25 @@ def _enforce_exterior(boxes, room_types, ids, attach_map=None):
             (w/2 + 0.01, cy),
             (1-w/2-0.01, cy),
         ]
-        x, y = min(candidates, key=lambda p: (p[0]-ref_x)**2 + (p[1]-ref_y)**2)
-        boxes[i, 0] = x
-        boxes[i, 1] = y
+
+        current_hard = _hard_violation_cost(boxes, i, ids)
+
+        best = None
+        best_key = None
+        for x, y in candidates:
+            trial = boxes.clone()
+            trial[i, 0] = x
+            trial[i, 1] = y
+            trial[i] = _clamp_box(trial[i].unsqueeze(0))[0]
+            if _hard_violation_cost(trial, i, ids) > current_hard + 1e-9:
+                continue
+            dist = (x - ref_x) ** 2 + (y - ref_y) ** 2
+            if best_key is None or dist < best_key:
+                best_key = dist
+                best = trial[i].clone()
+
+        if best is not None:
+            boxes[i] = best
     return _clamp_box(boxes)
 
 
@@ -428,6 +579,7 @@ def refine_single_layout(
     mask,
     iterations=70,
     margin=0.008,
+    return_log=False,
 ):
     original = _clamp_box(prediction.detach().clone())
     boxes = original.clone()
@@ -468,13 +620,33 @@ def refine_single_layout(
         )
     )
 
+    move_log = []
+
     for _ in range(iterations):
         changed = False
 
         for i in ids:
-            changed |= _place_one(
+            # Minimal-movement gate: leave a room exactly where the
+            # model put it unless something concrete is actually wrong
+            # (collision, unmet required adjacency, off the exterior
+            # wall it needs). A room is never relocated just because a
+            # marginally "nicer" position exists.
+            reason = _validity_reason(boxes, i, room_types, ids, attach_map)
+            if reason is None:
+                continue
+
+            before = boxes[i].clone()
+            moved = _place_one(
                 boxes, i, room_types, original, ids, attach_map, bedroom_ids, living_id
             )
+            changed |= moved
+            if moved:
+                move_log.append({
+                    "room_index": i,
+                    "type": ROOM_NAMES.get(int(room_types[i]), "?"),
+                    "reason": reason,
+                    "displacement": _distance(_center(before), _center(boxes[i])),
+                })
 
         boxes = _enforce_exterior(boxes, room_types, ids, attach_map)
 
@@ -507,6 +679,7 @@ def refine_single_layout(
                     (mx, ay + ah/2 + mh/2 + margin),
                 ]
 
+                before = boxes[mover].clone()
                 best = boxes[mover].clone()
                 best_cost = _total_priority_cost(
                     boxes, room_types, original, ids, attach_map, bedroom_ids, living_id
@@ -527,11 +700,20 @@ def refine_single_layout(
                 if not torch.allclose(best, boxes[mover], atol=1e-6):
                     boxes[mover] = best
                     changed = True
+                    move_log.append({
+                        "room_index": mover,
+                        "type": ROOM_NAMES.get(int(room_types[mover]), "?"),
+                        "reason": "collision",
+                        "displacement": _distance(_center(before), _center(boxes[mover])),
+                    })
 
         if not changed:
             break
 
-    return boxes * (mask > 0).unsqueeze(-1).to(boxes.dtype)
+    result = boxes * (mask > 0).unsqueeze(-1).to(boxes.dtype)
+    if return_log:
+        return result, move_log
+    return result
 
 
 # ------------------------------------------------------------
@@ -544,17 +726,25 @@ def refine_layout(
     mask,
     iterations=70,
     margin=0.008,
+    return_log=False,
 ):
-    return torch.stack([
-        refine_single_layout(
-            prediction[b],
-            room_types[b],
-            mask[b],
-            iterations,
-            margin,
+    if not return_log:
+        return torch.stack([
+            refine_single_layout(
+                prediction[b], room_types[b], mask[b], iterations, margin,
+            )
+            for b in range(prediction.shape[0])
+        ], dim=0)
+
+    results, logs = [], []
+    for b in range(prediction.shape[0]):
+        boxes, log = refine_single_layout(
+            prediction[b], room_types[b], mask[b], iterations, margin,
+            return_log=True,
         )
-        for b in range(prediction.shape[0])
-    ], dim=0)
+        results.append(boxes)
+        logs.append(log)
+    return torch.stack(results, dim=0), logs
 
 
 # ------------------------------------------------------------

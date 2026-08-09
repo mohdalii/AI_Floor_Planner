@@ -32,6 +32,8 @@ from geometry._layout._solver import (  # noqa: E402
     refine_layout,
     collision_rate,
     boundary_violation_rate,
+    validate_layout,
+    _build_attach_map,
     SIZE_RANGES,
 )
 
@@ -269,13 +271,17 @@ def generate_floor_plan(
 
     with torch.no_grad():
         raw = model(global_x, room_types, room_indices, mask.logical_not())
-        solved = refine_layout(raw, room_types, mask)
+        solved, move_logs = refine_layout(raw, room_types, mask, return_log=True)
 
     solved_collision = collision_rate(solved, mask)
     solved_boxes_cpu = solved[0].detach().cpu()
     plot_width_m, plot_depth_m = estimate_plot_dimensions_m(
         rooms, solved_boxes_cpu, solved_collision
     )
+
+    ids = list(range(len(rooms)))
+    attach_map = _build_attach_map(solved_boxes_cpu, room_types[0].cpu(), ids)
+    checklist = validate_layout(solved_boxes_cpu, room_types[0].cpu(), ids, attach_map)
 
     return {
         "rooms": rooms,
@@ -289,6 +295,8 @@ def generate_floor_plan(
         "plot_depth_m": plot_depth_m,
         "plot_area_m2": plot_width_m * plot_depth_m,
         "plot_expanded": (plot_width_m * plot_depth_m) > BASE_HOME_AREA_M2 + 1e-6,
+        "move_log": move_logs[0],
+        "validation_checklist": checklist,
     }
 
 
@@ -389,6 +397,16 @@ if __name__ == "__main__":
     print(f"Recommended plot               : {result['plot_width_m']:.1f} m x {result['plot_depth_m']:.1f} m"
           f" (~{result['plot_area_m2']:.0f} m²)"
           f"{' (expanded)' if result['plot_expanded'] else ''}")
+
+    print(f"\nRooms moved: {len(result['move_log'])} / {len(result['rooms'])}")
+    for entry in result["move_log"]:
+        room = result["rooms"][entry["room_index"]]
+        print(f"  {room['type']}_{room['room_index']:<2d} moved {entry['displacement']:.3f}"
+              f"  reason: {entry['reason']}")
+
+    print("\nFinal validation checklist:")
+    for check, passed in result["validation_checklist"].items():
+        print(f"  [{'x' if passed else ' '}] {check}")
 
     output_path = OUTPUT_DIR / "demo_plan.png"
     render(result, output_path)
