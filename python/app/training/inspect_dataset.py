@@ -72,3 +72,9 @@ print("Geometry :", kitchen.geom_type)
 print("Area :", kitchen.area)
 
 print("Bounds :", kitchen.bounds)
+
+print("\n================ BEDROOM COORDINATES ================\n")
+
+for poly in bedroom.geoms:
+    print(list(poly.exterior.coords)[:10])
+    break
