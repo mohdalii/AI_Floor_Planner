@@ -110,7 +110,30 @@ def _boundary_distance(box):
     return min(cx - w/2, cy - h/2, 1-cx-w/2, 1-cy-h/2)
 
 
-def _room_cost(boxes, i, room_types, original, ids):
+def _gap_to_nearest(boxes, i, ids):
+    """Boundary-to-boundary distance to the closest other room (0 if
+    touching or overlapping) - a proxy for "does this look connected"."""
+    ax, ay, aw, ah = [float(v) for v in boxes[i]]
+    ax1, ay1, ax2, ay2 = ax - aw/2, ay - ah/2, ax + aw/2, ay + ah/2
+
+    best = None
+    for j in ids:
+        if j == i:
+            continue
+        bx, by, bw, bh = [float(v) for v in boxes[j]]
+        bx1, by1, bx2, by2 = bx - bw/2, by - bh/2, bx + bw/2, by + bh/2
+
+        dx = max(ax1 - bx2, bx1 - ax2, 0.0)
+        dy = max(ay1 - by2, by1 - ay2, 0.0)
+        gap = math.hypot(dx, dy)
+
+        if best is None or gap < best:
+            best = gap
+
+    return best if best is not None else 0.0
+
+
+def _room_cost(boxes, i, room_types, original, ids, displacement_weight=1.8, gap_weight=0.0):
     t = int(room_types[i])
     b = boxes[i]
     cost = 0.0
@@ -118,7 +141,7 @@ def _room_cost(boxes, i, room_types, original, ids):
     # Keep the final layout reasonably close to the neural prediction.
     dx = float(b[0] - original[i, 0])
     dy = float(b[1] - original[i, 1])
-    cost += 1.8 * (dx*dx + dy*dy)
+    cost += displacement_weight * (dx*dx + dy*dy)
 
     # Penalize excessive resizing, but allow strong correction of pathological boxes.
     oa = max(float(original[i, 2] * original[i, 3]), 1e-6)
@@ -147,16 +170,23 @@ def _room_cost(boxes, i, room_types, original, ids):
         edge = min(cx, cy, 1-cx, 1-cy)
         cost += 2.0 * max(0.06 - edge, 0.0) ** 2
 
-    # Penalize overlaps strongly.
+    # Penalize overlaps strongly - the flat term means the search will
+    # never trade a gap-closing win for even a sliver of new overlap.
     for j in ids:
         if j == i:
             continue
         ow, oh = _overlap(b, boxes[j])
         if ow > 0 and oh > 0:
+            cost += 500.0
             cost += 160.0 * ow * oh
             # Stronger penalty for large interpenetration.
             cost += 35.0 * min(ow / max(float(b[2]), 1e-6),
                                 oh / max(float(b[3]), 1e-6))
+
+    # Gap-closing: pull this room toward its nearest neighbor so the
+    # layout reads as one connected home instead of floating boxes.
+    if gap_weight:
+        cost += gap_weight * _gap_to_nearest(boxes, i, ids)
 
     return cost
 
@@ -214,8 +244,11 @@ def _relationship_cost(boxes, room_types, ids):
     return cost
 
 
-def _total_cost(boxes, room_types, original, ids):
-    value = sum(_room_cost(boxes, i, room_types, original, ids) for i in ids)
+def _total_cost(boxes, room_types, original, ids, displacement_weight=1.8, gap_weight=0.0):
+    value = sum(
+        _room_cost(boxes, i, room_types, original, ids, displacement_weight, gap_weight)
+        for i in ids
+    )
     value += 6.0 * _relationship_cost(boxes, room_types, ids)
     return value
 
@@ -247,10 +280,11 @@ def _candidate_centers(box, room_type, living_center=None):
     return candidates
 
 
-def _place_one(boxes, i, room_types, original, ids, living_center):
+def _place_one(boxes, i, room_types, original, ids, living_center,
+                displacement_weight=1.8, gap_weight=0.0):
     current = boxes[i].clone()
     best = current.clone()
-    best_cost = _total_cost(boxes, room_types, original, ids)
+    best_cost = _total_cost(boxes, room_types, original, ids, displacement_weight, gap_weight)
 
     t = int(room_types[i])
     for cx, cy in _candidate_centers(current, t, living_center):
@@ -259,7 +293,7 @@ def _place_one(boxes, i, room_types, original, ids, living_center):
         trial[i, 1] = cy
         trial[i] = _clamp_box(trial[i].unsqueeze(0))[0]
 
-        cost = _total_cost(trial, room_types, original, ids)
+        cost = _total_cost(trial, room_types, original, ids, displacement_weight, gap_weight)
         if cost + 1e-7 < best_cost:
             best_cost = cost
             best = trial[i].clone()
@@ -383,6 +417,28 @@ def refine_single_layout(
                 if not torch.allclose(best, boxes[mover], atol=1e-6):
                     boxes[mover] = best
                     changed = True
+
+        if not changed:
+            break
+
+    # Consolidation pass: the layout is now collision-free but rooms
+    # can still be left floating apart with dead space between them.
+    # Pull each room toward its nearest neighbor so walls end up
+    # shared like a real house, using a much lighter pull back toward
+    # the original prediction (we're rearranging within an already-
+    # valid layout, not re-solving collisions) - the flat +500
+    # overlap penalty in _room_cost keeps this from ever reintroducing
+    # a collision to save a smaller gap.
+    for _ in range(50):
+        changed = False
+
+        for i in ids:
+            changed |= _place_one(
+                boxes, i, room_types, original, ids, living_center,
+                displacement_weight=0.15, gap_weight=90.0,
+            )
+
+        boxes = _enforce_exterior(boxes, room_types, ids)
 
         if not changed:
             break
