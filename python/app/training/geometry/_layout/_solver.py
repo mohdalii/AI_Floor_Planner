@@ -183,7 +183,7 @@ def _relationship_cost(boxes, room_types, ids):
     if kitchen and living:
         for i in kitchen:
             d = _distance(_center(boxes[i]), _center(boxes[living[0]]))
-            cost += 2.2 * d*d
+            cost += 2.2 * max(d - 0.35, 0.0) ** 2
 
     if baths and bedrooms:
         for b in baths:
@@ -224,43 +224,19 @@ def _candidate_centers(box, room_type, living_center=None):
     cx, cy, w, h = [float(v) for v in box]
     candidates = [(cx, cy)]
 
-    # Small local moves first.
-    step = 0.06
-    for dx, dy in [
-        (-step, 0), (step, 0), (0, -step), (0, step),
-        (-step, -step), (-step, step), (step, -step), (step, step),
-        (-0.12, 0), (0.12, 0), (0, -0.12), (0, 0.12),
-    ]:
-        candidates.append((cx + dx, cy + dy))
+    # Local moves only, at increasing scale - correct just enough to
+    # clear a collision, don't teleport to a generic template slot.
+    for step in (0.03, 0.06, 0.10, 0.16, 0.24):
+        for dx, dy in [
+            (-step, 0), (step, 0), (0, -step), (0, step),
+            (-step, -step), (-step, step), (step, -step), (step, step),
+        ]:
+            candidates.append((cx + dx, cy + dy))
 
     t = int(room_type)
 
-    # Architectural fallback slots.
-    if t == 4:  # balcony
-        candidates += [(0.18, 0.90), (0.50, 0.90), (0.82, 0.90),
-                       (0.10, 0.50), (0.90, 0.50)]
-    elif t == 7:  # front door
-        candidates += [(0.50, 0.04), (0.18, 0.04), (0.82, 0.04),
-                       (0.04, 0.50), (0.96, 0.50)]
-    elif t == 3:  # living
-        candidates += [(0.50, 0.50), (0.42, 0.50), (0.58, 0.50)]
-    elif t == 2:  # kitchen
-        candidates += [(0.34, 0.50), (0.66, 0.50), (0.50, 0.34),
-                       (0.50, 0.66)]
-    elif t == 0:  # bedrooms
-        candidates += [(0.25, 0.75), (0.50, 0.78), (0.75, 0.75),
-                       (0.25, 0.25), (0.50, 0.22), (0.75, 0.25)]
-    elif t == 1:  # bathrooms
-        candidates += [(0.38, 0.62), (0.62, 0.62), (0.38, 0.38),
-                       (0.62, 0.38), (0.50, 0.62)]
-    elif t == 6:
-        candidates += [(0.10, 0.50), (0.90, 0.50), (0.50, 0.15),
-                       (0.50, 0.85)]
-    else:
-        candidates += [(0.25, 0.50), (0.75, 0.50), (0.50, 0.25),
-                       (0.50, 0.75)]
-
-    # If living exists, add positions around it.
+    # If living exists, allow moving toward/away from it - still a
+    # local, relative adjustment, not a fixed global slot.
     if living_center is not None and t != 3:
         lx, ly = living_center
         candidates += [
@@ -328,20 +304,22 @@ def refine_single_layout(
     if not ids:
         return boxes * 0
 
-    # First repair pathological sizes.
+    # Only repair pathologically-sized boxes (near-zero or absurdly
+    # large) - leave normally-sized model predictions untouched rather
+    # than forcing every room into a hand-tuned architectural range.
     for i in ids:
-        boxes[i] = _resize_box(boxes[i], int(room_types[i]))
+        t = int(room_types[i])
+        area = max(float(boxes[i, 2] * boxes[i, 3]), 1e-6)
+        lo, hi = SIZE_RANGES.get(t, (0.02, 0.30))
+        if area < lo * 0.3 or area > hi * 2.0:
+            boxes[i] = _resize_box(boxes[i], t)
 
-    # Establish a central living anchor when one exists.
+    # Establish a living anchor (if one exists) for relative placement
+    # of other rooms - without forcibly relocating it.
     living_ids = [i for i in ids if int(room_types[i]) == 3]
     living_center = None
     if living_ids:
         li = max(living_ids, key=lambda i: float(boxes[i, 2] * boxes[i, 3]))
-        # Only move a wildly misplaced living room toward the center.
-        lx, ly = _center(boxes[li])
-        if lx < 0.18 or lx > 0.82 or ly < 0.18 or ly > 0.82:
-            boxes[li, 0] = 0.50
-            boxes[li, 1] = 0.50
         living_center = _center(boxes[li])
 
     boxes = _enforce_exterior(boxes, room_types, ids)
