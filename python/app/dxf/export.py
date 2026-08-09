@@ -15,7 +15,11 @@ from ezdxf.enums import TextEntityAlignment
 ROOT = Path(__file__).resolve().parents[3]
 
 
-def export_to_dxf(rooms, boxes, output_path, plot_size_m=10.0):
+def export_to_dxf(rooms, boxes, output_path, plot_width_m=None, plot_depth_m=None):
+    plot_width_m = plot_width_m or 10.0
+    plot_depth_m = plot_depth_m or 10.0
+    label_height = min(plot_width_m, plot_depth_m) * 0.02
+
     doc = ezdxf.new("R2010")
     msp = doc.modelspace()
 
@@ -23,7 +27,10 @@ def export_to_dxf(rooms, boxes, output_path, plot_size_m=10.0):
     doc.layers.add(name="LABELS", color=3)
 
     for room, box in zip(rooms, boxes):
-        cx, cy, w, h = [float(v) * plot_size_m for v in box]
+        cx = float(box[0]) * plot_width_m
+        cy = float(box[1]) * plot_depth_m
+        w = float(box[2]) * plot_width_m
+        h = float(box[3]) * plot_depth_m
         x1, y1 = cx - w / 2, cy - h / 2
         x2, y2 = cx + w / 2, cy + h / 2
 
@@ -35,7 +42,7 @@ def export_to_dxf(rooms, boxes, output_path, plot_size_m=10.0):
 
         label = msp.add_text(
             f"{room['type']}_{room['room_index']}",
-            dxfattribs={"layer": "LABELS", "height": plot_size_m * 0.02},
+            dxfattribs={"layer": "LABELS", "height": label_height},
         )
         label.set_placement((cx, cy), align=TextEntityAlignment.MIDDLE_CENTER)
 
@@ -58,7 +65,6 @@ if __name__ == "__main__":
         "living_rooms": 1,
         "balconies": 2,
         "storages": 1,
-        "stairs": 0,
     }
 
     print("=" * 70)
@@ -68,8 +74,13 @@ if __name__ == "__main__":
     result = generate_floor_plan(demo_requirements)
 
     output_path = ROOT / "dataset" / "generated_plans" / "demo_plan.dxf"
-    export_to_dxf(result["rooms"], result["solved_boxes"], output_path)
+    export_to_dxf(
+        result["rooms"], result["solved_boxes"], output_path,
+        plot_width_m=result["plot_width_m"],
+        plot_depth_m=result["plot_depth_m"],
+    )
 
     print(f"\nRooms exported: {len(result['rooms'])}")
+    print(f"Plot size     : {result['plot_width_m']:.1f} m x {result['plot_depth_m']:.1f} m")
     print(f"Saved DXF to  : {output_path}")
     print("\nDone.")

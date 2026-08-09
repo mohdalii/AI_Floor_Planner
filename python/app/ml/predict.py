@@ -10,6 +10,7 @@ every other script under python/app/training only replays fixed
 dataset samples.
 """
 
+import math
 import sys
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from geometry._layout._solver import (  # noqa: E402
     refine_layout,
     collision_rate,
     boundary_violation_rate,
+    SIZE_RANGES,
 )
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -131,6 +133,10 @@ def load_model():
 
 
 def build_room_list(requirements):
+    # NOTE: staircases are deliberately not part of this MVP. Even if
+    # `requirements` includes a "stairs" count, no stair room is ever
+    # generated - the rule engine, solver, and plot sizing below never
+    # reserve, move for, or otherwise reason about one.
     counts = [
         ("bedroom", 0, requirements.get("bedrooms", 0)),
         ("bathroom", 1, requirements.get("bathrooms", 0)),
@@ -138,7 +144,6 @@ def build_room_list(requirements):
         ("living", 3, requirements.get("living_rooms", 0)),
         ("balcony", 4, requirements.get("balconies", 0)),
         ("storage", 5, requirements.get("storages", 0)),
-        ("stair", 6, requirements.get("stairs", 0)),
         ("front_door", 7, requirements.get("front_doors", 1)),
     ]
 
@@ -157,6 +162,10 @@ def build_room_list(requirements):
 
 
 def build_global_features(requirements, plot_area_norm, wall_depth_norm):
+    # The model's 9th input slot is a "stairs count" feature it was
+    # trained on. Since the MVP never generates a stair room, this is
+    # always fed as 0 - telling the model "no stairs" is what keeps its
+    # conditioning consistent with what's actually being generated.
     return torch.tensor(
         [
             float(plot_area_norm),
@@ -167,10 +176,66 @@ def build_global_features(requirements, plot_area_norm, wall_depth_norm):
             float(requirements.get("living_rooms", 0)),
             float(requirements.get("balconies", 0)),
             float(requirements.get("storages", 0)),
-            float(requirements.get("stairs", 0)),
+            0.0,
         ],
         dtype=torch.float32,
     )
+
+
+BASE_HOME_AREA_M2 = 90.0
+USABLE_PLOT_FRACTION = 0.82
+MIN_ASPECT_RATIO = 0.6
+MAX_ASPECT_RATIO = 1.7
+
+
+def estimate_plot_dimensions_m(rooms, solved_boxes, solved_collision_rate=0.0,
+                                base_home_area_m2=BASE_HOME_AREA_M2):
+    """The geometry model always predicts room boxes inside a fixed
+    [0, 1] square - it doesn't actually shrink rooms when told the
+    plot is bigger (verified empirically: predicted sizes barely move
+    across a 4x range of plot_area_norm, since it wasn't trained to
+    respond to that feature that way). So "these rooms don't fit"
+    can't be fixed by feeding the model a bigger number, and a single
+    fixed plot size for every request (e.g. always 10m x 10m) doesn't
+    make sense either - a 1BHK and a 5-bedroom house shouldn't get the
+    same footprint.
+
+    Instead, estimate how much real-world area this specific room list
+    actually needs from the rooms' minimum reasonable areas
+    (SIZE_RANGES) plus a circulation allowance, and pick a width x
+    depth (not forced to be square) whose aspect ratio matches how the
+    solved layout is actually shaped - a request that solved into a
+    wide arrangement gets a wide plot, a deep one gets a deep plot.
+    The room proportions themselves still come entirely from the model
+    and the solver; this only sets the real-world scale and shape.
+    """
+    total_min_fraction = sum(
+        SIZE_RANGES.get(r["type_id"], (0.02, 0.30))[0] for r in rooms
+    )
+
+    needed_scale = total_min_fraction / USABLE_PLOT_FRACTION
+
+    # If the solver still couldn't reach zero collisions even after
+    # resizing/repositioning everything it could, that's direct
+    # evidence the normalized plot was genuinely too tight for this
+    # room list - scale up further in proportion to how bad it was.
+    if solved_collision_rate > 0:
+        needed_scale *= (1.0 + solved_collision_rate)
+
+    needed_scale = max(1.0, needed_scale)
+    home_area_m2 = base_home_area_m2 * needed_scale
+
+    xs = [float(b[0] - b[2]/2) for b in solved_boxes] + [float(b[0] + b[2]/2) for b in solved_boxes]
+    ys = [float(b[1] - b[3]/2) for b in solved_boxes] + [float(b[1] + b[3]/2) for b in solved_boxes]
+    extent_x = (max(xs) - min(xs)) if xs else 1.0
+    extent_y = (max(ys) - min(ys)) if ys else 1.0
+
+    aspect = extent_x / max(extent_y, 1e-6)
+    aspect = min(max(aspect, MIN_ASPECT_RATIO), MAX_ASPECT_RATIO)
+
+    depth_m = math.sqrt(home_area_m2 / aspect)
+    width_m = home_area_m2 / depth_m
+    return width_m, depth_m
 
 
 def generate_floor_plan(
@@ -206,19 +271,35 @@ def generate_floor_plan(
         raw = model(global_x, room_types, room_indices, mask.logical_not())
         solved = refine_layout(raw, room_types, mask)
 
+    solved_collision = collision_rate(solved, mask)
+    solved_boxes_cpu = solved[0].detach().cpu()
+    plot_width_m, plot_depth_m = estimate_plot_dimensions_m(
+        rooms, solved_boxes_cpu, solved_collision
+    )
+
     return {
         "rooms": rooms,
         "raw_boxes": raw[0].detach().cpu(),
-        "solved_boxes": solved[0].detach().cpu(),
+        "solved_boxes": solved_boxes_cpu,
         "raw_collision_rate": collision_rate(raw, mask),
-        "solved_collision_rate": collision_rate(solved, mask),
+        "solved_collision_rate": solved_collision,
         "raw_boundary_violation_rate": boundary_violation_rate(raw, mask),
         "solved_boundary_violation_rate": boundary_violation_rate(solved, mask),
+        "plot_width_m": plot_width_m,
+        "plot_depth_m": plot_depth_m,
+        "plot_area_m2": plot_width_m * plot_depth_m,
+        "plot_expanded": (plot_width_m * plot_depth_m) > BASE_HOME_AREA_M2 + 1e-6,
     }
 
 
 def _draw(ax, boxes, rooms, title):
     ax.set_title(title, fontsize=10)
+
+    bedroom_areas = [
+        (i, float(boxes[i][2]) * float(boxes[i][3]))
+        for i, r in enumerate(rooms) if r["type"] == "bedroom"
+    ]
+    master_index = max(bedroom_areas, key=lambda p: p[1])[0] if bedroom_areas else None
 
     for i, room in enumerate(rooms):
         cx, cy, w, h = [float(v) for v in boxes[i]]
@@ -237,9 +318,12 @@ def _draw(ax, boxes, rooms, title):
         )
         ax.add_patch(rect)
 
+        label = f"{room['type']}_{room['room_index']}"
+        if i == master_index:
+            label += " (master)"
+
         ax.text(
-            cx, cy,
-            f"{room['type']}_{room['room_index']}",
+            cx, cy, label,
             ha="center", va="center", fontsize=7,
         )
 
@@ -261,7 +345,17 @@ def render(result, output_path, title="Generated Floor Plan"):
         f"AFTER LAYOUT SOLVER\nCollision: {result['solved_collision_rate']:.1%}",
     )
 
-    fig.suptitle(title)
+    width_m = result.get("plot_width_m")
+    depth_m = result.get("plot_depth_m")
+    subtitle = ""
+    if width_m and depth_m:
+        note = " (expanded - too many rooms for the baseline plot)" if result.get("plot_expanded") else ""
+        subtitle = (
+            f"\nRecommended plot: {width_m:.1f} m x {depth_m:.1f} m "
+            f"(~{width_m*depth_m:.0f} m²){note}"
+        )
+
+    fig.suptitle(title + subtitle)
     fig.tight_layout()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -277,7 +371,6 @@ if __name__ == "__main__":
         "living_rooms": 1,
         "balconies": 2,
         "storages": 1,
-        "stairs": 0,
     }
 
     print("=" * 70)
@@ -293,6 +386,9 @@ if __name__ == "__main__":
     print(f"Solved collision rate         : {result['solved_collision_rate']:.4f}")
     print(f"Raw boundary violation rate   : {result['raw_boundary_violation_rate']:.4f}")
     print(f"Solved boundary violation rate: {result['solved_boundary_violation_rate']:.4f}")
+    print(f"Recommended plot               : {result['plot_width_m']:.1f} m x {result['plot_depth_m']:.1f} m"
+          f" (~{result['plot_area_m2']:.0f} m²)"
+          f"{' (expanded)' if result['plot_expanded'] else ''}")
 
     output_path = OUTPUT_DIR / "demo_plan.png"
     render(result, output_path)
