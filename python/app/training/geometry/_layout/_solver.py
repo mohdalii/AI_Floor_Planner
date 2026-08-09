@@ -302,12 +302,22 @@ def _relationship_cost(boxes, i, room_types, ids, attach_map, bedroom_ids, livin
     return cost
 
 
-def _geometry_cost(boxes, i, original):
-    """Priority 3: distance moved from the raw V4 prediction."""
+def _geometry_cost(boxes, i, original, room_types):
+    """Priority 3: distance moved from the raw V4 prediction, weighted by
+    the room's rule-engine priority. This is how "resolve collisions in
+    rule-engine order" is actually enforced - not by forbidding a
+    higher-priority room from ever moving (that risks deadlock: the
+    designated mover can be boxed in with nowhere to go while the anchor
+    sits frozen), but by making it economically reluctant to. Both rooms
+    in a colliding pair are always free to search for a fix, so the
+    solver can never get stuck - but a living room "spends" roughly 4x
+    more cost per unit of displacement than a front door, so in practice
+    the low-priority room is consistently the one that gives way."""
     b = boxes[i]
     dx = float(b[0] - original[i, 0])
     dy = float(b[1] - original[i, 1])
-    return math.hypot(dx, dy)
+    weight = 0.3 + _priority(int(room_types[i])) / 50.0
+    return weight * math.hypot(dx, dy)
 
 
 def _total_priority_cost(boxes, room_types, original, ids, attach_map, bedroom_ids, living_id):
@@ -319,7 +329,7 @@ def _total_priority_cost(boxes, room_types, original, ids, attach_map, bedroom_i
         relationship += _relationship_cost(
             boxes, i, room_types, ids, attach_map, bedroom_ids, living_id
         )
-        geometry += _geometry_cost(boxes, i, original)
+        geometry += _geometry_cost(boxes, i, original, room_types)
     return (hard, relationship, geometry)
 
 
@@ -421,6 +431,24 @@ def _place_one(boxes, i, room_types, original, ids, attach_map, bedroom_ids, liv
     changed = not torch.allclose(best, current, atol=1e-6)
     boxes[i] = best
     return changed
+
+
+def _collision_mover(room_types, boxes, i, j):
+    """Given two colliding rooms, which one is responsible for moving.
+    The lower-priority room always yields to the higher-priority one
+    (living/bedrooms are never displaced to accommodate a balcony or
+    storage), so collision resolution follows the same hierarchy as
+    everything else in the rule engine instead of whichever room
+    happens to get checked first. Ties (equal priority) break on
+    area - the smaller room yields - then on index, so exactly one
+    side is ever responsible for a given pair."""
+    pi, pj = _priority(int(room_types[i])), _priority(int(room_types[j]))
+    if pi != pj:
+        return i if pi < pj else j
+    ai, aj = _room_area(boxes, i), _room_area(boxes, j)
+    if ai != aj:
+        return i if ai < aj else j
+    return i if i < j else j
 
 
 def _validity_reason(boxes, i, room_types, ids, attach_map,
@@ -663,8 +691,7 @@ def refine_single_layout(
                 if ow <= 1e-5 or oh <= 1e-5:
                     continue
 
-                ti, tj = int(room_types[i]), int(room_types[j])
-                mover = j if _priority(ti) >= _priority(tj) else i
+                mover = _collision_mover(room_types, boxes, i, j)
                 anchor = i if mover == j else j
 
                 m = boxes[mover].clone()
