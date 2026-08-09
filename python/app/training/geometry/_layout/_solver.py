@@ -133,7 +133,55 @@ def _gap_to_nearest(boxes, i, ids):
     return best if best is not None else 0.0
 
 
-def _room_cost(boxes, i, room_types, original, ids, displacement_weight=1.8, gap_weight=0.0):
+def _gap_to_room(boxes, i, j):
+    """Boundary-to-boundary distance from room i to one specific room j."""
+    ax, ay, aw, ah = [float(v) for v in boxes[i]]
+    ax1, ay1, ax2, ay2 = ax - aw/2, ay - ah/2, ax + aw/2, ay + ah/2
+
+    bx, by, bw, bh = [float(v) for v in boxes[j]]
+    bx1, by1, bx2, by2 = bx - bw/2, by - bh/2, bx + bw/2, by + bh/2
+
+    dx = max(ax1 - bx2, bx1 - ax2, 0.0)
+    dy = max(ay1 - by2, by1 - ay2, 0.0)
+    return math.hypot(dx, dy)
+
+
+def _build_attach_map(room_types, ids):
+    """Decide which specific room each bathroom/front door should attach
+    to, so the layout follows real house conventions instead of just
+    clustering toward whatever happens to be nearest:
+
+      - front door always attaches to the living room / entrance hall.
+      - if there are at least as many bathrooms as bedrooms, each
+        bedroom gets its own en-suite bathroom (paired in order).
+      - otherwise bathrooms are shared, so they attach to the living
+        room / hall for central access instead of any one bedroom.
+    """
+    ordered = sorted(ids)
+    bedrooms = [i for i in ordered if int(room_types[i]) == 0]
+    baths = [i for i in ordered if int(room_types[i]) == 1]
+    doors = [i for i in ordered if int(room_types[i]) == 7]
+    living = [i for i in ordered if int(room_types[i]) == 3]
+
+    living_id = living[0] if living else None
+    attach = {}
+
+    ensuite = bool(bedrooms) and len(baths) >= len(bedrooms)
+    for k, bi in enumerate(baths):
+        if ensuite and k < len(bedrooms):
+            attach[bi] = bedrooms[k]
+        elif living_id is not None:
+            attach[bi] = living_id
+
+    for di in doors:
+        if living_id is not None:
+            attach[di] = living_id
+
+    return attach
+
+
+def _room_cost(boxes, i, room_types, original, ids, displacement_weight=1.8,
+                gap_weight=0.0, attach_map=None, attach_weight=0.0):
     t = int(room_types[i])
     b = boxes[i]
     cost = 0.0
@@ -183,9 +231,16 @@ def _room_cost(boxes, i, room_types, original, ids, displacement_weight=1.8, gap
             cost += 35.0 * min(ow / max(float(b[2]), 1e-6),
                                 oh / max(float(b[3]), 1e-6))
 
-    # Gap-closing: pull this room toward its nearest neighbor so the
-    # layout reads as one connected home instead of floating boxes.
-    if gap_weight:
+    # Gap-closing. Rooms with a specific attachment target (an en-suite
+    # bathroom's bedroom, a shared bathroom's or the front door's living
+    # room) are pulled toward exactly that room, not just whatever's
+    # closest - otherwise a bathroom could end up snapped to a balcony
+    # instead of its bedroom just because it happened to be nearer.
+    # Everything else still closes to its nearest neighbor.
+    target = attach_map.get(i) if attach_map else None
+    if target is not None and attach_weight:
+        cost += attach_weight * _gap_to_room(boxes, i, target)
+    elif gap_weight:
         cost += gap_weight * _gap_to_nearest(boxes, i, ids)
 
     return cost
@@ -244,16 +299,18 @@ def _relationship_cost(boxes, room_types, ids):
     return cost
 
 
-def _total_cost(boxes, room_types, original, ids, displacement_weight=1.8, gap_weight=0.0):
+def _total_cost(boxes, room_types, original, ids, displacement_weight=1.8,
+                 gap_weight=0.0, attach_map=None, attach_weight=0.0):
     value = sum(
-        _room_cost(boxes, i, room_types, original, ids, displacement_weight, gap_weight)
+        _room_cost(boxes, i, room_types, original, ids, displacement_weight,
+                   gap_weight, attach_map, attach_weight)
         for i in ids
     )
     value += 6.0 * _relationship_cost(boxes, room_types, ids)
     return value
 
 
-def _candidate_centers(box, room_type, living_center=None):
+def _candidate_centers(box, room_type, living_center=None, attach_center=None):
     cx, cy, w, h = [float(v) for v in box]
     candidates = [(cx, cy)]
 
@@ -277,23 +334,41 @@ def _candidate_centers(box, room_type, living_center=None):
             (lx, ly - 0.28), (lx, ly + 0.28),
         ]
 
+    # A room with a specific attachment target (an en-suite bathroom's
+    # bedroom, a shared bathroom's or the door's living room) needs a
+    # way to jump toward THAT room directly - local steps alone can get
+    # stuck behind other rooms and never reach it.
+    if attach_center is not None:
+        tx, ty = attach_center
+        for r in (0.12, 0.20, 0.30):
+            candidates += [
+                (tx - r, ty), (tx + r, ty),
+                (tx, ty - r), (tx, ty + r),
+            ]
+
     return candidates
 
 
 def _place_one(boxes, i, room_types, original, ids, living_center,
-                displacement_weight=1.8, gap_weight=0.0):
+                displacement_weight=1.8, gap_weight=0.0,
+                attach_map=None, attach_weight=0.0):
     current = boxes[i].clone()
     best = current.clone()
-    best_cost = _total_cost(boxes, room_types, original, ids, displacement_weight, gap_weight)
+    best_cost = _total_cost(boxes, room_types, original, ids, displacement_weight,
+                             gap_weight, attach_map, attach_weight)
 
     t = int(room_types[i])
-    for cx, cy in _candidate_centers(current, t, living_center):
+    target = attach_map.get(i) if attach_map else None
+    attach_center = _center(boxes[target]) if target is not None else None
+
+    for cx, cy in _candidate_centers(current, t, living_center, attach_center):
         trial = boxes.clone()
         trial[i, 0] = cx
         trial[i, 1] = cy
         trial[i] = _clamp_box(trial[i].unsqueeze(0))[0]
 
-        cost = _total_cost(trial, room_types, original, ids, displacement_weight, gap_weight)
+        cost = _total_cost(trial, room_types, original, ids, displacement_weight,
+                            gap_weight, attach_map, attach_weight)
         if cost + 1e-7 < best_cost:
             best_cost = cost
             best = trial[i].clone()
@@ -356,6 +431,11 @@ def refine_single_layout(
         li = max(living_ids, key=lambda i: float(boxes[i, 2] * boxes[i, 3]))
         living_center = _center(boxes[li])
 
+    # Decide real house adjacency once: which bedroom (if any) each
+    # bathroom is en-suite to, and that the front door leads into the
+    # living room / entrance hall.
+    attach_map = _build_attach_map(room_types, ids)
+
     boxes = _enforce_exterior(boxes, room_types, ids)
 
     # High-priority rooms settle first, then smaller/support rooms.
@@ -371,7 +451,8 @@ def refine_single_layout(
 
         for i in ids:
             changed |= _place_one(
-                boxes, i, room_types, original, ids, living_center
+                boxes, i, room_types, original, ids, living_center,
+                attach_map=attach_map, attach_weight=20.0,
             )
 
         boxes = _enforce_exterior(boxes, room_types, ids)
@@ -436,6 +517,7 @@ def refine_single_layout(
             changed |= _place_one(
                 boxes, i, room_types, original, ids, living_center,
                 displacement_weight=0.15, gap_weight=90.0,
+                attach_map=attach_map, attach_weight=140.0,
             )
 
         boxes = _enforce_exterior(boxes, room_types, ids)
