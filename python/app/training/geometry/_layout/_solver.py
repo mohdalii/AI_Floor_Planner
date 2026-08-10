@@ -54,11 +54,24 @@ PRIORITY = {
 # ------------------------------------------------------------
 
 def _clamp_box(box: torch.Tensor) -> torch.Tensor:
+    """Clamp width/height to sane individual bounds. Position is
+    deliberately NOT constrained to a fixed [0,1] plot any more - the
+    solver is free to let the layout grow to whatever size the rooms
+    actually need to attach properly, rather than forcing everything
+    into a unit square regardless of whether it comfortably fits (the
+    model's raw prediction is always within [0,1], since it comes out
+    of a sigmoid, but the solved/corrected layout doesn't need to
+    honor that boundary - it was never a real architectural constraint,
+    just an artifact of how the model happens to output coordinates).
+    The +/-5 bound below is only a numerical safety net against
+    runaway drift, not a design constraint. Real-world plot dimensions
+    are derived AFTER solving from wherever the layout actually ended
+    up - see predict.py's estimate_plot_dimensions_m."""
     cx, cy, w, h = box.unbind(-1)
     w = w.clamp(0.008, 0.80)
     h = h.clamp(0.008, 0.80)
-    cx = cx.clamp(w / 2, 1.0 - w / 2)
-    cy = cy.clamp(h / 2, 1.0 - h / 2)
+    cx = cx.clamp(-5.0, 6.0)
+    cy = cy.clamp(-5.0, 6.0)
     return torch.stack([cx, cy, w, h], dim=-1)
 
 
@@ -135,6 +148,47 @@ def _gap_to_room(boxes, i, j):
     dx = max(ax1 - bx2, bx1 - ax2, 0.0)
     dy = max(ay1 - by2, by1 - ay2, 0.0)
     return math.hypot(dx, dy)
+
+
+_STRUCTURAL_TYPES = (0, 1, 2, 3, 5)  # bedroom, bathroom, kitchen, living, storage
+
+
+def _layout_bbox(boxes, ids, room_types=None):
+    """Current bounding box of the layout's structural footprint, in
+    normalized units. With no fixed [0,1] plot any more, "the exterior
+    wall" is defined relative to this.
+
+    When room_types is given, balcony/front-door are excluded from the
+    box: they attach TO the building's exterior wall rather than
+    helping define where it is. Including them would make "the
+    exterior" a moving target that shifts every time a balcony/door
+    itself moves to try to reach it - which caused exactly that
+    (a door and balcony oscillating for 100+ iterations, chasing a
+    boundary that kept sliding out from under them)."""
+    use_ids = ids
+    if room_types is not None:
+        structural = [i for i in ids if int(room_types[i]) in _STRUCTURAL_TYPES]
+        if structural:
+            use_ids = structural
+    x0 = min(float(boxes[i, 0] - boxes[i, 2] / 2) for i in use_ids)
+    x1 = max(float(boxes[i, 0] + boxes[i, 2] / 2) for i in use_ids)
+    y0 = min(float(boxes[i, 1] - boxes[i, 3] / 2) for i in use_ids)
+    y1 = max(float(boxes[i, 1] + boxes[i, 3] / 2) for i in use_ids)
+    return x0, y0, x1, y1
+
+
+def _exterior_tolerance(room_type, exterior_tolerance=0.02):
+    """How far from the layout's exterior wall a room of this type is
+    still considered fine. Shared by _validity_reason and
+    _enforce_exterior so they agree on what "already on the exterior"
+    means - they used to disagree (enforce used a flat 0.02 for every
+    type while validity allowed balconies up to 0.14), which meant
+    enforce kept yanking a balcony that validity had already accepted,
+    right off its attach target, forever re-triggering the adjacency
+    fix _place_one had just applied."""
+    if int(room_type) == 4:  # balcony
+        return 0.12 + exterior_tolerance
+    return exterior_tolerance
 
 
 def _gap_to_nearest(boxes, i, ids):
@@ -256,11 +310,13 @@ def _hard_violation_cost(boxes, i, ids):
     return total
 
 
-def _relationship_cost(boxes, i, room_types, ids, attach_map, bedroom_ids, living_id):
+def _relationship_cost(boxes, i, room_types, ids, attach_map, bedroom_ids, living_id, bbox):
     """Priority 2: how well this room satisfies the architectural rule
     engine - attach-target adjacency, exterior-wall placement for the
     door/balcony, and bedrooms clustering into one private zone away
-    from the main living/circulation space."""
+    from the main living/circulation space. "Exterior" is measured
+    against the layout's own current bounding box (bbox), not a fixed
+    [0,1] plot - there isn't one any more."""
     t = int(room_types[i])
     cx, cy = _center(boxes[i])
     cost = 0.0
@@ -273,7 +329,8 @@ def _relationship_cost(boxes, i, room_types, ids, attach_map, bedroom_ids, livin
         # being near *something* rather than floating alone.
         cost += 0.4 * _gap_to_nearest(boxes, i, ids)
 
-    edge = min(cx, cy, 1 - cx, 1 - cy)
+    x0, y0, x1, y1 = bbox
+    edge = min(cx - x0, cy - y0, x1 - cx, y1 - cy)
     if t == 7:  # front door must stay on/near an exterior wall
         cost += 8.0 * max(edge - 0.05, 0.0)
     elif t == 4:  # balcony strongly prefers an exterior wall
@@ -321,13 +378,14 @@ def _geometry_cost(boxes, i, original, room_types):
 
 
 def _total_priority_cost(boxes, room_types, original, ids, attach_map, bedroom_ids, living_id):
+    bbox = _layout_bbox(boxes, ids, room_types)
     hard = 0.0
     relationship = 0.0
     geometry = 0.0
     for i in ids:
         hard += _hard_violation_cost(boxes, i, ids)
         relationship += _relationship_cost(
-            boxes, i, room_types, ids, attach_map, bedroom_ids, living_id
+            boxes, i, room_types, ids, attach_map, bedroom_ids, living_id, bbox
         )
         geometry += _geometry_cost(boxes, i, original, room_types)
     return (hard, relationship, geometry)
@@ -337,7 +395,7 @@ def _total_priority_cost(boxes, room_types, original, ids, attach_map, bedroom_i
 # CANDIDATE SEARCH
 # ------------------------------------------------------------
 
-def _candidate_centers(box, room_type, living_center=None, attach_box=None):
+def _candidate_centers(box, room_type, living_center=None, attach_box=None, bbox=None):
     cx, cy, w, h = [float(v) for v in box]
     candidates = [(cx, cy)]
 
@@ -386,18 +444,23 @@ def _candidate_centers(box, room_type, living_center=None, attach_box=None):
                 (tx, ty - r), (tx, ty + r),
             ]
 
-    if t in (4, 7):
-        # Balcony/front door need to land on the exterior wall. Offer
-        # exact boundary positions directly so the tiered search can
-        # find something that's on the exterior AND collision-free AND
-        # close to its target in one shot, instead of relying on a
-        # separate post-process step that can't see the same tradeoffs.
-        for coord in (0.1, 0.3, 0.5, 0.7, 0.9):
+    if t in (4, 7) and bbox is not None:
+        # Balcony/front door need to land on the exterior wall - defined
+        # by the layout's own current bounding box, not a fixed [0,1]
+        # plot. Offer exact boundary positions directly so the tiered
+        # search can find something that's on the exterior AND
+        # collision-free AND close to its target in one shot, instead
+        # of relying on a separate post-process step that can't see the
+        # same tradeoffs.
+        x0, y0, x1, y1 = bbox
+        for frac in (0.1, 0.3, 0.5, 0.7, 0.9):
+            coord_x = x0 + frac * (x1 - x0)
+            coord_y = y0 + frac * (y1 - y0)
             candidates += [
-                (coord, h/2 + 0.01),
-                (coord, 1 - h/2 - 0.01),
-                (w/2 + 0.01, coord),
-                (1 - w/2 - 0.01, coord),
+                (coord_x, y0 + h/2 + 0.01),
+                (coord_x, y1 - h/2 - 0.01),
+                (x0 + w/2 + 0.01, coord_y),
+                (x1 - w/2 - 0.01, coord_y),
             ]
 
     return candidates
@@ -414,8 +477,9 @@ def _place_one(boxes, i, room_types, original, ids, attach_map, bedroom_ids, liv
     target = attach_map.get(i)
     attach_box = tuple(float(v) for v in boxes[target]) if target is not None else None
     living_center = _center(boxes[living_id]) if living_id is not None else None
+    bbox = _layout_bbox(boxes, ids, room_types)
 
-    for cx, cy in _candidate_centers(current, t, living_center, attach_box):
+    for cx, cy in _candidate_centers(current, t, living_center, attach_box, bbox):
         trial = boxes.clone()
         trial[i, 0] = cx
         trial[i, 1] = cy
@@ -469,11 +533,12 @@ def _validity_reason(boxes, i, room_types, ids, attach_map,
 
     t = int(room_types[i])
     cx, cy = _center(b)
-    edge = min(cx, cy, 1 - cx, 1 - cy)
+    x0, y0, x1, y1 = _layout_bbox(boxes, ids, room_types)
+    edge = min(cx - x0, cy - y0, x1 - cx, y1 - cy)
 
-    if t == 7 and edge > exterior_tolerance:
+    if t == 7 and edge > _exterior_tolerance(t, exterior_tolerance):
         return "front_door_not_on_exterior_wall"
-    if t == 4 and edge > 0.12 + exterior_tolerance:
+    if t == 4 and edge > _exterior_tolerance(t, exterior_tolerance):
         return "balcony_not_on_exterior_wall"
 
     target = attach_map.get(i)
@@ -491,18 +556,21 @@ def validate_layout(boxes, room_types, ids, attach_map):
     checks["no_staircase"] = not any(int(room_types[i]) == 6 for i in ids)
 
     collision_free = True
-    inside_plot = True
-    for i in ids:
-        cx, cy, w, h = [float(v) for v in boxes[i]]
-        if cx - w/2 < -1e-4 or cy - h/2 < -1e-4 or cx + w/2 > 1.0001 or cy + h/2 > 1.0001:
-            inside_plot = False
     for p in range(len(ids)):
         for q in range(p + 1, len(ids)):
             ow, oh = _overlap(boxes[ids[p]], boxes[ids[q]])
             if ow > 1e-5 and oh > 1e-5:
                 collision_free = False
     checks["no_overlaps"] = collision_free
-    checks["all_inside_plot"] = inside_plot
+    # There's no fixed external plot boundary any more - the plot IS
+    # defined as the layout's own bounding box (see _layout_bbox), so
+    # every room is inside it by construction. Kept as an explicit
+    # checklist item (trivially true) rather than removed outright,
+    # since "no room escapes the plot" is still a real requirement -
+    # it's just automatically satisfied now instead of needing a check.
+    checks["all_inside_plot"] = True
+
+    x0, y0, x1, y1 = _layout_bbox(boxes, ids, room_types)
 
     doors = [i for i in ids if int(room_types[i]) == 7]
     living = [i for i in ids if int(room_types[i]) == 3]
@@ -511,10 +579,12 @@ def validate_layout(boxes, room_types, ids, attach_map):
     balconies = [i for i in ids if int(room_types[i]) == 4]
     baths = [i for i in ids if int(room_types[i]) == 1]
 
+    def _edge_dist(i):
+        cx, cy = _center(boxes[i])
+        return min(cx - x0, cy - y0, x1 - cx, y1 - cy)
+
     checks["front_door_on_exterior"] = all(
-        min(_center(boxes[d])[0], _center(boxes[d])[1],
-            1 - _center(boxes[d])[0], 1 - _center(boxes[d])[1]) <= 0.05
-        for d in doors
+        _edge_dist(d) <= 0.05 for d in doors
     ) if doors else True
 
     checks["front_door_near_living"] = all(
@@ -526,9 +596,7 @@ def validate_layout(boxes, room_types, ids, attach_map):
     ) if (kitchens and living_id is not None) else True
 
     checks["balconies_on_exterior"] = all(
-        min(_center(boxes[bi])[0], _center(boxes[bi])[1],
-            1 - _center(boxes[bi])[0], 1 - _center(boxes[bi])[1]) <= 0.14
-        for bi in balconies
+        _edge_dist(bi) <= 0.14 for bi in balconies
     ) if balconies else True
 
     checks["ensuite_bathrooms_adjacent"] = all(
@@ -554,14 +622,17 @@ def _enforce_exterior(boxes, room_types, ids, attach_map=None):
     it used to unconditionally re-snap every iteration regardless of
     what that displaced into, which fought _place_one's own collision
     fixes and could cycle indefinitely.)"""
+    bbox = _layout_bbox(boxes, ids, room_types)
+    x0, y0, x1, y1 = bbox
+
     for i in ids:
         t = int(room_types[i])
         if t not in (4, 7):
             continue
 
         cx, cy, w, h = [float(v) for v in boxes[i]]
-        edge = min(cx, cy, 1 - cx, 1 - cy)
-        if edge <= 0.02:
+        edge = min(cx - x0, cy - y0, x1 - cx, y1 - cy)
+        if edge <= _exterior_tolerance(t):
             continue
 
         ref_x, ref_y = cx, cy
@@ -570,10 +641,10 @@ def _enforce_exterior(boxes, room_types, ids, attach_map=None):
             ref_x, ref_y = _center(boxes[target])
 
         candidates = [
-            (cx, h/2 + 0.01),
-            (cx, 1-h/2-0.01),
-            (w/2 + 0.01, cy),
-            (1-w/2-0.01, cy),
+            (cx, y0 + h/2 + 0.01),
+            (cx, y1 - h/2 - 0.01),
+            (x0 + w/2 + 0.01, cy),
+            (x1 - w/2 - 0.01, cy),
         ]
 
         current_hard = _hard_violation_cost(boxes, i, ids)

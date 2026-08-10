@@ -186,58 +186,40 @@ def build_global_features(requirements, plot_area_norm, wall_depth_norm):
 
 BASE_HOME_AREA_M2 = 90.0
 USABLE_PLOT_FRACTION = 0.82
-MIN_ASPECT_RATIO = 0.6
-MAX_ASPECT_RATIO = 1.7
 
 
-def estimate_plot_dimensions_m(rooms, solved_boxes, solved_collision_rate=0.0,
-                                base_home_area_m2=BASE_HOME_AREA_M2):
-    """The geometry model always predicts room boxes inside a fixed
-    [0, 1] square - it doesn't actually shrink rooms when told the
-    plot is bigger (verified empirically: predicted sizes barely move
-    across a 4x range of plot_area_norm, since it wasn't trained to
-    respond to that feature that way). So "these rooms don't fit"
-    can't be fixed by feeding the model a bigger number, and a single
-    fixed plot size for every request (e.g. always 10m x 10m) doesn't
-    make sense either - a 1BHK and a 5-bedroom house shouldn't get the
-    same footprint.
+def estimate_plot_dimensions_m(rooms, solved_boxes, base_home_area_m2=BASE_HOME_AREA_M2):
+    """The geometry model always predicts room boxes on its own internal
+    scale - it doesn't actually shrink rooms when told the plot is
+    bigger (verified empirically: predicted sizes barely move across a
+    4x range of plot_area_norm, since it wasn't trained to respond to
+    that feature that way). The solver no longer forces the layout into
+    a fixed [0,1] square either (see _clamp_box in the solver) - it
+    lets rooms spread out to however much space they actually need to
+    attach properly, rather than compromising to fit an artificial box.
+    So the real-world plot size is derived from wherever the solved
+    layout actually ended up, not assumed in advance or forced to a
+    particular aspect ratio.
 
-    Instead, estimate how much real-world area this specific room list
-    actually needs from the rooms' minimum reasonable areas
-    (SIZE_RANGES) plus a circulation allowance, and pick a width x
-    depth (not forced to be square) whose aspect ratio matches how the
-    solved layout is actually shaped - a request that solved into a
-    wide arrangement gets a wide plot, a deep one gets a deep plot.
-    The room proportions themselves still come entirely from the model
-    and the solver; this only sets the real-world scale and shape.
+    A fixed meters-per-normalized-unit conversion is calibrated from
+    the room list's total minimum reasonable area (SIZE_RANGES) - what
+    a "just barely fits, nothing to spare" 1.0 x 1.0 layout would need
+    in real terms - then applied directly to the actual solved bounding
+    box extent, whatever size and shape that turned out to be.
     """
     total_min_fraction = sum(
         SIZE_RANGES.get(r["type_id"], (0.02, 0.30))[0] for r in rooms
     )
-
-    needed_scale = total_min_fraction / USABLE_PLOT_FRACTION
-
-    # If the solver still couldn't reach zero collisions even after
-    # resizing/repositioning everything it could, that's direct
-    # evidence the normalized plot was genuinely too tight for this
-    # room list - scale up further in proportion to how bad it was.
-    if solved_collision_rate > 0:
-        needed_scale *= (1.0 + solved_collision_rate)
-
-    needed_scale = max(1.0, needed_scale)
-    home_area_m2 = base_home_area_m2 * needed_scale
+    nominal_scale = max(1.0, total_min_fraction / USABLE_PLOT_FRACTION)
+    nominal_area_m2 = base_home_area_m2 * nominal_scale
+    meters_per_unit = math.sqrt(nominal_area_m2)
 
     xs = [float(b[0] - b[2]/2) for b in solved_boxes] + [float(b[0] + b[2]/2) for b in solved_boxes]
     ys = [float(b[1] - b[3]/2) for b in solved_boxes] + [float(b[1] + b[3]/2) for b in solved_boxes]
-    extent_x = (max(xs) - min(xs)) if xs else 1.0
-    extent_y = (max(ys) - min(ys)) if ys else 1.0
+    extent_x = max((max(xs) - min(xs)) if xs else 1.0, 0.2)
+    extent_y = max((max(ys) - min(ys)) if ys else 1.0, 0.2)
 
-    aspect = extent_x / max(extent_y, 1e-6)
-    aspect = min(max(aspect, MIN_ASPECT_RATIO), MAX_ASPECT_RATIO)
-
-    depth_m = math.sqrt(home_area_m2 / aspect)
-    width_m = home_area_m2 / depth_m
-    return width_m, depth_m
+    return extent_x * meters_per_unit, extent_y * meters_per_unit
 
 
 def generate_floor_plan(
@@ -275,9 +257,7 @@ def generate_floor_plan(
 
     solved_collision = collision_rate(solved, mask)
     solved_boxes_cpu = solved[0].detach().cpu()
-    plot_width_m, plot_depth_m = estimate_plot_dimensions_m(
-        rooms, solved_boxes_cpu, solved_collision
-    )
+    plot_width_m, plot_depth_m = estimate_plot_dimensions_m(rooms, solved_boxes_cpu)
 
     ids = list(range(len(rooms)))
     attach_map = _build_attach_map(solved_boxes_cpu, room_types[0].cpu(), ids)
@@ -290,7 +270,6 @@ def generate_floor_plan(
         "raw_collision_rate": collision_rate(raw, mask),
         "solved_collision_rate": solved_collision,
         "raw_boundary_violation_rate": boundary_violation_rate(raw, mask),
-        "solved_boundary_violation_rate": boundary_violation_rate(solved, mask),
         "plot_width_m": plot_width_m,
         "plot_depth_m": plot_depth_m,
         "plot_area_m2": plot_width_m * plot_depth_m,
@@ -335,8 +314,16 @@ def _draw(ax, boxes, rooms, title):
             ha="center", va="center", fontsize=7,
         )
 
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
+    # The solver no longer clamps rooms to a fixed [0,1] square, so the
+    # plotted extent has to be read from the actual boxes instead of
+    # assumed - a layout that needed to spread out to attach properly
+    # can legitimately extend beyond [0,1] now.
+    xs = [float(b[0] - b[2]/2) for b in boxes] + [float(b[0] + b[2]/2) for b in boxes]
+    ys = [float(b[1] - b[3]/2) for b in boxes] + [float(b[1] + b[3]/2) for b in boxes]
+    pad_x = max((max(xs) - min(xs)) * 0.05, 0.02) if xs else 0.05
+    pad_y = max((max(ys) - min(ys)) * 0.05, 0.02) if ys else 0.05
+    ax.set_xlim(min(xs) - pad_x, max(xs) + pad_x)
+    ax.set_ylim(min(ys) - pad_y, max(ys) + pad_y)
     ax.set_aspect("equal")
     ax.grid(True, alpha=0.3)
 
@@ -393,7 +380,6 @@ if __name__ == "__main__":
     print(f"Raw collision rate            : {result['raw_collision_rate']:.4f}")
     print(f"Solved collision rate         : {result['solved_collision_rate']:.4f}")
     print(f"Raw boundary violation rate   : {result['raw_boundary_violation_rate']:.4f}")
-    print(f"Solved boundary violation rate: {result['solved_boundary_violation_rate']:.4f}")
     print(f"Recommended plot               : {result['plot_width_m']:.1f} m x {result['plot_depth_m']:.1f} m"
           f" (~{result['plot_area_m2']:.0f} m²)"
           f"{' (expanded)' if result['plot_expanded'] else ''}")
